@@ -47,6 +47,7 @@ PROMPTS_PER_PAGE = 5
 LONG_TEXT_THRESHOLD = (
     300  # Characters - text blocks longer than this are shown in index
 )
+DEFAULT_MAX_PAGE_SIZE = None  # No limit by default
 
 
 def extract_text_from_content(content):
@@ -1295,7 +1296,7 @@ def generate_index_pagination_html(total_pages):
     return _macros.index_pagination(total_pages)
 
 
-def generate_html(json_path, output_dir, github_repo=None):
+def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
@@ -1352,12 +1353,9 @@ def generate_html(json_path, output_dir, github_repo=None):
         conversations.append(current_conv)
 
     total_convs = len(conversations)
-    total_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
 
-    for page_num in range(1, total_pages + 1):
-        start_idx = (page_num - 1) * PROMPTS_PER_PAGE
-        end_idx = min(start_idx + PROMPTS_PER_PAGE, total_convs)
-        page_convs = conversations[start_idx:end_idx]
+    # Helper function to render a page's HTML content
+    def render_page_content(page_convs, page_num, total_pages):
         messages_html = []
         for conv in page_convs:
             is_first = True
@@ -1371,7 +1369,7 @@ def generate_html(json_path, output_dir, github_repo=None):
                 is_first = False
         pagination_html = generate_pagination_html(page_num, total_pages)
         page_template = get_template("page.html")
-        page_content = page_template.render(
+        return page_template.render(
             css=CSS,
             js=JS,
             page_num=page_num,
@@ -1379,6 +1377,46 @@ def generate_html(json_path, output_dir, github_repo=None):
             pagination_html=pagination_html,
             messages_html="".join(messages_html),
         )
+
+    # Calculate pages with adaptive sizing if max_page_size is set
+    prompts_per_page = PROMPTS_PER_PAGE
+
+    if max_page_size:
+        # Try progressively smaller page sizes until all pages fit
+        while prompts_per_page >= 1:
+            total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+            all_fit = True
+
+            for page_num in range(1, total_pages + 1):
+                start_idx = (page_num - 1) * prompts_per_page
+                end_idx = min(start_idx + prompts_per_page, total_convs)
+                page_convs = conversations[start_idx:end_idx]
+                page_content = render_page_content(page_convs, page_num, total_pages)
+
+                if len(page_content.encode('utf-8')) > max_page_size:
+                    all_fit = False
+                    break
+
+            if all_fit:
+                break
+
+            # Reduce prompts per page and try again
+            prompts_per_page -= 1
+            if prompts_per_page < 1:
+                print(f"Warning: Some pages exceed {max_page_size} bytes even with 1 prompt per page")
+                prompts_per_page = 1
+                break
+
+        if prompts_per_page < PROMPTS_PER_PAGE:
+            print(f"Adjusted to {prompts_per_page} prompt(s) per page to stay under {max_page_size} bytes")
+
+    total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+
+    for page_num in range(1, total_pages + 1):
+        start_idx = (page_num - 1) * prompts_per_page
+        end_idx = min(start_idx + prompts_per_page, total_convs)
+        page_convs = conversations[start_idx:end_idx]
+        page_content = render_page_content(page_convs, page_num, total_pages)
         (output_dir / f"page-{page_num:03d}.html").write_text(
             page_content, encoding="utf-8"
         )
@@ -1393,7 +1431,7 @@ def generate_html(json_path, output_dir, github_repo=None):
         stats = analyze_conversation(conv["messages"])
         for tool, count in stats["tool_counts"].items():
             total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
-        page_num = (i // PROMPTS_PER_PAGE) + 1
+        page_num = (i // prompts_per_page) + 1
         for commit_hash, commit_msg, commit_ts in stats["commits"]:
             all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
     total_tool_calls = sum(total_tool_counts.values())
@@ -1410,7 +1448,7 @@ def generate_html(json_path, output_dir, github_repo=None):
         if conv["user_text"].startswith("Stop hook feedback:"):
             continue
         prompt_num += 1
-        page_num = (i // PROMPTS_PER_PAGE) + 1
+        page_num = (i // prompts_per_page) + 1
         msg_id = make_msg_id(conv["timestamp"])
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
@@ -1516,7 +1554,13 @@ def cli():
     default=10,
     help="Maximum number of sessions to show (default: 10)",
 )
-def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit):
+@click.option(
+    "--max-page-size",
+    type=int,
+    default=None,
+    help="Maximum page size in bytes. If set, reduces prompts per page to stay under this limit.",
+)
+def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit, max_page_size):
     """Select and convert a local Claude Code session to HTML."""
     projects_folder = Path.home() / ".claude" / "projects"
 
@@ -1567,7 +1611,7 @@ def local_cmd(output, output_auto, repo, gist, include_json, open_browser, limit
         output = Path(tempfile.gettempdir()) / f"claude-session-{session_file.stem}"
 
     output = Path(output)
-    generate_html(session_file, output, github_repo=repo)
+    generate_html(session_file, output, github_repo=repo, max_page_size=max_page_size)
 
     # Show output directory
     click.echo(f"Output: {output.resolve()}")
@@ -1668,7 +1712,13 @@ def fetch_url_to_tempfile(url):
     is_flag=True,
     help="Open the generated index.html in your default browser (default if no -o specified).",
 )
-def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_browser):
+@click.option(
+    "--max-page-size",
+    type=int,
+    default=None,
+    help="Maximum page size in bytes. If set, reduces prompts per page to stay under this limit.",
+)
+def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_browser, max_page_size):
     """Convert a Claude Code session JSON/JSONL file or URL to HTML."""
     # Handle URL input
     if is_url(json_file):
@@ -1698,7 +1748,7 @@ def json_cmd(json_file, output, output_auto, repo, gist, include_json, open_brow
         )
 
     output = Path(output)
-    generate_html(json_file_path, output, github_repo=repo)
+    generate_html(json_file_path, output, github_repo=repo, max_page_size=max_page_size)
 
     # Show output directory
     click.echo(f"Output: {output.resolve()}")
@@ -1775,7 +1825,7 @@ def format_session_for_display(session_data):
     return f"{repo_display:30}  {date_display:19}  {title}"
 
 
-def generate_html_from_session_data(session_data, output_dir, github_repo=None):
+def generate_html_from_session_data(session_data, output_dir, github_repo=None, max_page_size=None):
     """Generate HTML from session data dict (instead of file path)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -1826,12 +1876,9 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
         conversations.append(current_conv)
 
     total_convs = len(conversations)
-    total_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
 
-    for page_num in range(1, total_pages + 1):
-        start_idx = (page_num - 1) * PROMPTS_PER_PAGE
-        end_idx = min(start_idx + PROMPTS_PER_PAGE, total_convs)
-        page_convs = conversations[start_idx:end_idx]
+    # Helper function to render a page's HTML content
+    def render_page_content(page_convs, page_num, total_pages):
         messages_html = []
         for conv in page_convs:
             is_first = True
@@ -1845,7 +1892,7 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
                 is_first = False
         pagination_html = generate_pagination_html(page_num, total_pages)
         page_template = get_template("page.html")
-        page_content = page_template.render(
+        return page_template.render(
             css=CSS,
             js=JS,
             page_num=page_num,
@@ -1853,6 +1900,46 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
             pagination_html=pagination_html,
             messages_html="".join(messages_html),
         )
+
+    # Calculate pages with adaptive sizing if max_page_size is set
+    prompts_per_page = PROMPTS_PER_PAGE
+
+    if max_page_size:
+        # Try progressively smaller page sizes until all pages fit
+        while prompts_per_page >= 1:
+            total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+            all_fit = True
+
+            for page_num in range(1, total_pages + 1):
+                start_idx = (page_num - 1) * prompts_per_page
+                end_idx = min(start_idx + prompts_per_page, total_convs)
+                page_convs = conversations[start_idx:end_idx]
+                page_content = render_page_content(page_convs, page_num, total_pages)
+
+                if len(page_content.encode('utf-8')) > max_page_size:
+                    all_fit = False
+                    break
+
+            if all_fit:
+                break
+
+            # Reduce prompts per page and try again
+            prompts_per_page -= 1
+            if prompts_per_page < 1:
+                click.echo(f"Warning: Some pages exceed {max_page_size} bytes even with 1 prompt per page")
+                prompts_per_page = 1
+                break
+
+        if prompts_per_page < PROMPTS_PER_PAGE:
+            click.echo(f"Adjusted to {prompts_per_page} prompt(s) per page to stay under {max_page_size} bytes")
+
+    total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+
+    for page_num in range(1, total_pages + 1):
+        start_idx = (page_num - 1) * prompts_per_page
+        end_idx = min(start_idx + prompts_per_page, total_convs)
+        page_convs = conversations[start_idx:end_idx]
+        page_content = render_page_content(page_convs, page_num, total_pages)
         (output_dir / f"page-{page_num:03d}.html").write_text(
             page_content, encoding="utf-8"
         )
@@ -1867,7 +1954,7 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
         stats = analyze_conversation(conv["messages"])
         for tool, count in stats["tool_counts"].items():
             total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
-        page_num = (i // PROMPTS_PER_PAGE) + 1
+        page_num = (i // prompts_per_page) + 1
         for commit_hash, commit_msg, commit_ts in stats["commits"]:
             all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
     total_tool_calls = sum(total_tool_counts.values())
@@ -1884,7 +1971,7 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None):
         if conv["user_text"].startswith("Stop hook feedback:"):
             continue
         prompt_num += 1
-        page_num = (i // PROMPTS_PER_PAGE) + 1
+        page_num = (i // prompts_per_page) + 1
         msg_id = make_msg_id(conv["timestamp"])
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
