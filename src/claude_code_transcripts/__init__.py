@@ -1354,19 +1354,23 @@ def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
 
     total_convs = len(conversations)
 
+    # Helper function to render a single conversation's HTML content
+    def render_conv_html(conv):
+        messages_html = []
+        is_first = True
+        for log_type, message_json, timestamp in conv["messages"]:
+            msg_html = render_message(log_type, message_json, timestamp)
+            if msg_html:
+                # Wrap continuation summaries in collapsed details
+                if is_first and conv.get("is_continuation"):
+                    msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
+                messages_html.append(msg_html)
+            is_first = False
+        return "".join(messages_html)
+
     # Helper function to render a page's HTML content
     def render_page_content(page_convs, page_num, total_pages):
-        messages_html = []
-        for conv in page_convs:
-            is_first = True
-            for log_type, message_json, timestamp in conv["messages"]:
-                msg_html = render_message(log_type, message_json, timestamp)
-                if msg_html:
-                    # Wrap continuation summaries in collapsed details
-                    if is_first and conv.get("is_continuation"):
-                        msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
-                    messages_html.append(msg_html)
-                is_first = False
+        messages_html = [render_conv_html(conv) for conv in page_convs]
         pagination_html = generate_pagination_html(page_num, total_pages)
         page_template = get_template("page.html")
         return page_template.render(
@@ -1378,49 +1382,93 @@ def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
             messages_html="".join(messages_html),
         )
 
-    # Calculate pages with adaptive sizing if max_page_size is set
-    prompts_per_page = PROMPTS_PER_PAGE
+    # Calculate page assignments
+    # Returns list of (start_idx, end_idx) tuples for each page
+    def calculate_page_assignments(conversations, max_page_size):
+        if not max_page_size:
+            # Simple fixed-size pages
+            pages = []
+            for i in range(0, len(conversations), PROMPTS_PER_PAGE):
+                pages.append((i, min(i + PROMPTS_PER_PAGE, len(conversations))))
+            return pages
 
-    if max_page_size:
-        # Try progressively smaller page sizes until all pages fit
-        while prompts_per_page >= 1:
-            total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
-            all_fit = True
+        # Pre-calculate each conversation's rendered HTML size
+        conv_sizes = []
+        conv_html_cache = []
+        for conv in conversations:
+            html = render_conv_html(conv)
+            conv_html_cache.append(html)
+            conv_sizes.append(len(html.encode('utf-8')))
 
-            for page_num in range(1, total_pages + 1):
-                start_idx = (page_num - 1) * prompts_per_page
-                end_idx = min(start_idx + prompts_per_page, total_convs)
-                page_convs = conversations[start_idx:end_idx]
-                page_content = render_page_content(page_convs, page_num, total_pages)
+        # Estimate page overhead (CSS, JS, pagination, template wrapper)
+        # Render an empty page to measure the overhead
+        page_template = get_template("page.html")
+        empty_page = page_template.render(
+            css=CSS,
+            js=JS,
+            page_num=1,
+            total_pages=1,
+            pagination_html=generate_pagination_html(1, 1),
+            messages_html="",
+        )
+        base_overhead = len(empty_page.encode('utf-8'))
 
-                if len(page_content.encode('utf-8')) > max_page_size:
-                    all_fit = False
-                    break
+        # Greedily assign conversations to pages
+        pages = []
+        current_page_start = 0
+        current_page_size = base_overhead
+        current_page_count = 0
 
-            if all_fit:
-                break
+        for i, (conv_size, conv) in enumerate(zip(conv_sizes, conversations)):
+            # Check if adding this conversation would exceed limits
+            would_exceed_size = (current_page_size + conv_size) > max_page_size
+            would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
 
-            # Reduce prompts per page and try again
-            prompts_per_page -= 1
-            if prompts_per_page < 1:
-                print(f"Warning: Some pages exceed {max_page_size} bytes even with 1 prompt per page")
-                prompts_per_page = 1
-                break
+            if current_page_count > 0 and (would_exceed_size or would_exceed_count):
+                # Close current page and start a new one
+                pages.append((current_page_start, i))
+                current_page_start = i
+                current_page_size = base_overhead + conv_size
+                current_page_count = 1
+            else:
+                # Add to current page
+                current_page_size += conv_size
+                current_page_count += 1
 
-        if prompts_per_page < PROMPTS_PER_PAGE:
-            print(f"Adjusted to {prompts_per_page} prompt(s) per page to stay under {max_page_size} bytes")
+        # Close the final page
+        if current_page_start < len(conversations):
+            pages.append((current_page_start, len(conversations)))
 
-    total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+        # Warn about any single conversations that exceed max_page_size
+        for i, conv_size in enumerate(conv_sizes):
+            if conv_size + base_overhead > max_page_size:
+                print(f"Warning: Conversation {i+1} ({conv_size + base_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
 
-    for page_num in range(1, total_pages + 1):
-        start_idx = (page_num - 1) * prompts_per_page
-        end_idx = min(start_idx + prompts_per_page, total_convs)
+        return pages
+
+    # Calculate page assignments (list of (start_idx, end_idx) tuples)
+    page_assignments = calculate_page_assignments(conversations, max_page_size)
+    total_pages = len(page_assignments)
+
+    if max_page_size and total_pages > (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE:
+        fixed_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
+        print(f"Adaptive pagination: {total_pages} pages (vs {fixed_pages} with fixed {PROMPTS_PER_PAGE} prompts/page)")
+
+    # Generate pages
+    for page_num, (start_idx, end_idx) in enumerate(page_assignments, 1):
         page_convs = conversations[start_idx:end_idx]
         page_content = render_page_content(page_convs, page_num, total_pages)
         (output_dir / f"page-{page_num:03d}.html").write_text(
             page_content, encoding="utf-8"
         )
-        print(f"Generated page-{page_num:03d}.html")
+        print(f"Generated page-{page_num:03d}.html ({end_idx - start_idx} prompts, {len(page_content.encode('utf-8'))} bytes)")
+
+    # Build mapping from conversation index to page number
+    def get_page_for_conv(conv_idx):
+        for page_num, (start_idx, end_idx) in enumerate(page_assignments, 1):
+            if start_idx <= conv_idx < end_idx:
+                return page_num
+        return total_pages  # Fallback to last page
 
     # Calculate overall stats and collect all commits for timeline
     total_tool_counts = {}
@@ -1431,7 +1479,7 @@ def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
         stats = analyze_conversation(conv["messages"])
         for tool, count in stats["tool_counts"].items():
             total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
-        page_num = (i // prompts_per_page) + 1
+        page_num = get_page_for_conv(i)
         for commit_hash, commit_msg, commit_ts in stats["commits"]:
             all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
     total_tool_calls = sum(total_tool_counts.values())
@@ -1448,7 +1496,7 @@ def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
         if conv["user_text"].startswith("Stop hook feedback:"):
             continue
         prompt_num += 1
-        page_num = (i // prompts_per_page) + 1
+        page_num = get_page_for_conv(i)
         msg_id = make_msg_id(conv["timestamp"])
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
@@ -1877,19 +1925,23 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None, 
 
     total_convs = len(conversations)
 
+    # Helper function to render a single conversation's HTML content
+    def render_conv_html(conv):
+        messages_html = []
+        is_first = True
+        for log_type, message_json, timestamp in conv["messages"]:
+            msg_html = render_message(log_type, message_json, timestamp)
+            if msg_html:
+                # Wrap continuation summaries in collapsed details
+                if is_first and conv.get("is_continuation"):
+                    msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
+                messages_html.append(msg_html)
+            is_first = False
+        return "".join(messages_html)
+
     # Helper function to render a page's HTML content
     def render_page_content(page_convs, page_num, total_pages):
-        messages_html = []
-        for conv in page_convs:
-            is_first = True
-            for log_type, message_json, timestamp in conv["messages"]:
-                msg_html = render_message(log_type, message_json, timestamp)
-                if msg_html:
-                    # Wrap continuation summaries in collapsed details
-                    if is_first and conv.get("is_continuation"):
-                        msg_html = f'<details class="continuation"><summary>Session continuation summary</summary>{msg_html}</details>'
-                    messages_html.append(msg_html)
-                is_first = False
+        messages_html = [render_conv_html(conv) for conv in page_convs]
         pagination_html = generate_pagination_html(page_num, total_pages)
         page_template = get_template("page.html")
         return page_template.render(
@@ -1901,49 +1953,93 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None, 
             messages_html="".join(messages_html),
         )
 
-    # Calculate pages with adaptive sizing if max_page_size is set
-    prompts_per_page = PROMPTS_PER_PAGE
+    # Calculate page assignments
+    # Returns list of (start_idx, end_idx) tuples for each page
+    def calculate_page_assignments(conversations, max_page_size):
+        if not max_page_size:
+            # Simple fixed-size pages
+            pages = []
+            for i in range(0, len(conversations), PROMPTS_PER_PAGE):
+                pages.append((i, min(i + PROMPTS_PER_PAGE, len(conversations))))
+            return pages
 
-    if max_page_size:
-        # Try progressively smaller page sizes until all pages fit
-        while prompts_per_page >= 1:
-            total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
-            all_fit = True
+        # Pre-calculate each conversation's rendered HTML size
+        conv_sizes = []
+        conv_html_cache = []
+        for conv in conversations:
+            html = render_conv_html(conv)
+            conv_html_cache.append(html)
+            conv_sizes.append(len(html.encode('utf-8')))
 
-            for page_num in range(1, total_pages + 1):
-                start_idx = (page_num - 1) * prompts_per_page
-                end_idx = min(start_idx + prompts_per_page, total_convs)
-                page_convs = conversations[start_idx:end_idx]
-                page_content = render_page_content(page_convs, page_num, total_pages)
+        # Estimate page overhead (CSS, JS, pagination, template wrapper)
+        # Render an empty page to measure the overhead
+        page_template = get_template("page.html")
+        empty_page = page_template.render(
+            css=CSS,
+            js=JS,
+            page_num=1,
+            total_pages=1,
+            pagination_html=generate_pagination_html(1, 1),
+            messages_html="",
+        )
+        base_overhead = len(empty_page.encode('utf-8'))
 
-                if len(page_content.encode('utf-8')) > max_page_size:
-                    all_fit = False
-                    break
+        # Greedily assign conversations to pages
+        pages = []
+        current_page_start = 0
+        current_page_size = base_overhead
+        current_page_count = 0
 
-            if all_fit:
-                break
+        for i, (conv_size, conv) in enumerate(zip(conv_sizes, conversations)):
+            # Check if adding this conversation would exceed limits
+            would_exceed_size = (current_page_size + conv_size) > max_page_size
+            would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
 
-            # Reduce prompts per page and try again
-            prompts_per_page -= 1
-            if prompts_per_page < 1:
-                click.echo(f"Warning: Some pages exceed {max_page_size} bytes even with 1 prompt per page")
-                prompts_per_page = 1
-                break
+            if current_page_count > 0 and (would_exceed_size or would_exceed_count):
+                # Close current page and start a new one
+                pages.append((current_page_start, i))
+                current_page_start = i
+                current_page_size = base_overhead + conv_size
+                current_page_count = 1
+            else:
+                # Add to current page
+                current_page_size += conv_size
+                current_page_count += 1
 
-        if prompts_per_page < PROMPTS_PER_PAGE:
-            click.echo(f"Adjusted to {prompts_per_page} prompt(s) per page to stay under {max_page_size} bytes")
+        # Close the final page
+        if current_page_start < len(conversations):
+            pages.append((current_page_start, len(conversations)))
 
-    total_pages = (total_convs + prompts_per_page - 1) // prompts_per_page
+        # Warn about any single conversations that exceed max_page_size
+        for i, conv_size in enumerate(conv_sizes):
+            if conv_size + base_overhead > max_page_size:
+                click.echo(f"Warning: Conversation {i+1} ({conv_size + base_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
 
-    for page_num in range(1, total_pages + 1):
-        start_idx = (page_num - 1) * prompts_per_page
-        end_idx = min(start_idx + prompts_per_page, total_convs)
+        return pages
+
+    # Calculate page assignments (list of (start_idx, end_idx) tuples)
+    page_assignments = calculate_page_assignments(conversations, max_page_size)
+    total_pages = len(page_assignments)
+
+    if max_page_size and total_pages > (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE:
+        fixed_pages = (total_convs + PROMPTS_PER_PAGE - 1) // PROMPTS_PER_PAGE
+        click.echo(f"Adaptive pagination: {total_pages} pages (vs {fixed_pages} with fixed {PROMPTS_PER_PAGE} prompts/page)")
+
+    # Generate pages
+    for page_num, (start_idx, end_idx) in enumerate(page_assignments, 1):
         page_convs = conversations[start_idx:end_idx]
         page_content = render_page_content(page_convs, page_num, total_pages)
         (output_dir / f"page-{page_num:03d}.html").write_text(
             page_content, encoding="utf-8"
         )
-        click.echo(f"Generated page-{page_num:03d}.html")
+        click.echo(f"Generated page-{page_num:03d}.html ({end_idx - start_idx} prompts, {len(page_content.encode('utf-8'))} bytes)")
+
+    # Build mapping from conversation index to page number
+    def get_page_for_conv(conv_idx):
+        for page_num, (start_idx, end_idx) in enumerate(page_assignments, 1):
+            if start_idx <= conv_idx < end_idx:
+                return page_num
+        return total_pages  # Fallback to last page
 
     # Calculate overall stats and collect all commits for timeline
     total_tool_counts = {}
@@ -1954,7 +2050,7 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None, 
         stats = analyze_conversation(conv["messages"])
         for tool, count in stats["tool_counts"].items():
             total_tool_counts[tool] = total_tool_counts.get(tool, 0) + count
-        page_num = (i // prompts_per_page) + 1
+        page_num = get_page_for_conv(i)
         for commit_hash, commit_msg, commit_ts in stats["commits"]:
             all_commits.append((commit_ts, commit_hash, commit_msg, page_num, i))
     total_tool_calls = sum(total_tool_counts.values())
@@ -1971,7 +2067,7 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None, 
         if conv["user_text"].startswith("Stop hook feedback:"):
             continue
         prompt_num += 1
-        page_num = (i // prompts_per_page) + 1
+        page_num = get_page_for_conv(i)
         msg_id = make_msg_id(conv["timestamp"])
         link = f"page-{page_num:03d}.html#{msg_id}"
         rendered_content = render_markdown_text(conv["user_text"])
