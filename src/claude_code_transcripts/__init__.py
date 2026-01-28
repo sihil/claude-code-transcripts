@@ -1394,57 +1394,75 @@ def generate_html(json_path, output_dir, github_repo=None, max_page_size=None):
 
         # Pre-calculate each conversation's rendered HTML size
         conv_sizes = []
-        conv_html_cache = []
         for conv in conversations:
             html = render_conv_html(conv)
-            conv_html_cache.append(html)
             conv_sizes.append(len(html.encode('utf-8')))
 
-        # Estimate page overhead (CSS, JS, pagination, template wrapper)
-        # Render an empty page to measure the overhead
-        page_template = get_template("page.html")
-        empty_page = page_template.render(
-            css=CSS,
-            js=JS,
-            page_num=1,
-            total_pages=1,
-            pagination_html=generate_pagination_html(1, 1),
-            messages_html="",
-        )
-        base_overhead = len(empty_page.encode('utf-8'))
+        # Helper to calculate base overhead for a given total_pages
+        def get_base_overhead(total_pages):
+            page_template = get_template("page.html")
+            empty_page = page_template.render(
+                css=CSS,
+                js=JS,
+                page_num=1,
+                total_pages=total_pages,
+                pagination_html=generate_pagination_html(1, total_pages),
+                messages_html="",
+            )
+            return len(empty_page.encode('utf-8'))
 
-        # Greedily assign conversations to pages
-        pages = []
-        current_page_start = 0
-        current_page_size = base_overhead
-        current_page_count = 0
+        # Helper to greedily assign pages given a base overhead
+        def assign_pages(base_overhead):
+            pages = []
+            current_page_start = 0
+            current_page_size = base_overhead
+            current_page_count = 0
 
-        for i, (conv_size, conv) in enumerate(zip(conv_sizes, conversations)):
-            # Check if adding this conversation would exceed limits
-            would_exceed_size = (current_page_size + conv_size) > max_page_size
-            would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
+            for i, conv_size in enumerate(conv_sizes):
+                # Check if adding this conversation would exceed limits
+                would_exceed_size = (current_page_size + conv_size) > max_page_size
+                would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
 
-            if current_page_count > 0 and (would_exceed_size or would_exceed_count):
-                # Close current page and start a new one
-                pages.append((current_page_start, i))
-                current_page_start = i
-                current_page_size = base_overhead + conv_size
-                current_page_count = 1
-            else:
-                # Add to current page
-                current_page_size += conv_size
-                current_page_count += 1
+                if current_page_count > 0 and (would_exceed_size or would_exceed_count):
+                    # Close current page and start a new one
+                    pages.append((current_page_start, i))
+                    current_page_start = i
+                    current_page_size = base_overhead + conv_size
+                    current_page_count = 1
+                else:
+                    # Add to current page
+                    current_page_size += conv_size
+                    current_page_count += 1
 
-        # Close the final page
-        if current_page_start < len(conversations):
-            pages.append((current_page_start, len(conversations)))
+            # Close the final page
+            if current_page_start < len(conv_sizes):
+                pages.append((current_page_start, len(conv_sizes)))
+
+            return pages
+
+        # Two-pass algorithm to handle pagination size variation:
+        # 1. First pass with minimal overhead to estimate total_pages
+        # 2. Second pass with correct overhead based on actual total_pages
+        initial_overhead = get_base_overhead(1)
+        initial_pages = assign_pages(initial_overhead)
+        estimated_total = len(initial_pages)
+
+        # Recalculate with correct pagination overhead
+        final_overhead = get_base_overhead(estimated_total)
+        final_pages = assign_pages(final_overhead)
+
+        # If page count changed, iterate until stable (usually converges in 1-2 iterations)
+        while len(final_pages) != estimated_total:
+            estimated_total = len(final_pages)
+            final_overhead = get_base_overhead(estimated_total)
+            final_pages = assign_pages(final_overhead)
 
         # Warn about any single conversations that exceed max_page_size
         for i, conv_size in enumerate(conv_sizes):
-            if conv_size + base_overhead > max_page_size:
-                print(f"Warning: Conversation {i+1} ({conv_size + base_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
+            if conv_size + final_overhead > max_page_size:
+                print(f"Warning: Conversation {i+1} ({conv_size + final_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
 
-        return pages
+        return final_pages
 
     # Calculate page assignments (list of (start_idx, end_idx) tuples)
     page_assignments = calculate_page_assignments(conversations, max_page_size)
@@ -1965,57 +1983,75 @@ def generate_html_from_session_data(session_data, output_dir, github_repo=None, 
 
         # Pre-calculate each conversation's rendered HTML size
         conv_sizes = []
-        conv_html_cache = []
         for conv in conversations:
             html = render_conv_html(conv)
-            conv_html_cache.append(html)
             conv_sizes.append(len(html.encode('utf-8')))
 
-        # Estimate page overhead (CSS, JS, pagination, template wrapper)
-        # Render an empty page to measure the overhead
-        page_template = get_template("page.html")
-        empty_page = page_template.render(
-            css=CSS,
-            js=JS,
-            page_num=1,
-            total_pages=1,
-            pagination_html=generate_pagination_html(1, 1),
-            messages_html="",
-        )
-        base_overhead = len(empty_page.encode('utf-8'))
+        # Helper to calculate base overhead for a given total_pages
+        def get_base_overhead(total_pages):
+            page_template = get_template("page.html")
+            empty_page = page_template.render(
+                css=CSS,
+                js=JS,
+                page_num=1,
+                total_pages=total_pages,
+                pagination_html=generate_pagination_html(1, total_pages),
+                messages_html="",
+            )
+            return len(empty_page.encode('utf-8'))
 
-        # Greedily assign conversations to pages
-        pages = []
-        current_page_start = 0
-        current_page_size = base_overhead
-        current_page_count = 0
+        # Helper to greedily assign pages given a base overhead
+        def assign_pages(base_overhead):
+            pages = []
+            current_page_start = 0
+            current_page_size = base_overhead
+            current_page_count = 0
 
-        for i, (conv_size, conv) in enumerate(zip(conv_sizes, conversations)):
-            # Check if adding this conversation would exceed limits
-            would_exceed_size = (current_page_size + conv_size) > max_page_size
-            would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
+            for i, conv_size in enumerate(conv_sizes):
+                # Check if adding this conversation would exceed limits
+                would_exceed_size = (current_page_size + conv_size) > max_page_size
+                would_exceed_count = current_page_count >= PROMPTS_PER_PAGE
 
-            if current_page_count > 0 and (would_exceed_size or would_exceed_count):
-                # Close current page and start a new one
-                pages.append((current_page_start, i))
-                current_page_start = i
-                current_page_size = base_overhead + conv_size
-                current_page_count = 1
-            else:
-                # Add to current page
-                current_page_size += conv_size
-                current_page_count += 1
+                if current_page_count > 0 and (would_exceed_size or would_exceed_count):
+                    # Close current page and start a new one
+                    pages.append((current_page_start, i))
+                    current_page_start = i
+                    current_page_size = base_overhead + conv_size
+                    current_page_count = 1
+                else:
+                    # Add to current page
+                    current_page_size += conv_size
+                    current_page_count += 1
 
-        # Close the final page
-        if current_page_start < len(conversations):
-            pages.append((current_page_start, len(conversations)))
+            # Close the final page
+            if current_page_start < len(conv_sizes):
+                pages.append((current_page_start, len(conv_sizes)))
+
+            return pages
+
+        # Two-pass algorithm to handle pagination size variation:
+        # 1. First pass with minimal overhead to estimate total_pages
+        # 2. Second pass with correct overhead based on actual total_pages
+        initial_overhead = get_base_overhead(1)
+        initial_pages = assign_pages(initial_overhead)
+        estimated_total = len(initial_pages)
+
+        # Recalculate with correct pagination overhead
+        final_overhead = get_base_overhead(estimated_total)
+        final_pages = assign_pages(final_overhead)
+
+        # If page count changed, iterate until stable (usually converges in 1-2 iterations)
+        while len(final_pages) != estimated_total:
+            estimated_total = len(final_pages)
+            final_overhead = get_base_overhead(estimated_total)
+            final_pages = assign_pages(final_overhead)
 
         # Warn about any single conversations that exceed max_page_size
         for i, conv_size in enumerate(conv_sizes):
-            if conv_size + base_overhead > max_page_size:
-                click.echo(f"Warning: Conversation {i+1} ({conv_size + base_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
+            if conv_size + final_overhead > max_page_size:
+                click.echo(f"Warning: Conversation {i+1} ({conv_size + final_overhead} bytes) exceeds max_page_size ({max_page_size} bytes)")
 
-        return pages
+        return final_pages
 
     # Calculate page assignments (list of (start_idx, end_idx) tuples)
     page_assignments = calculate_page_assignments(conversations, max_page_size)
